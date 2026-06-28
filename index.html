@@ -18,6 +18,9 @@
     position: absolute;
     top: 0;
     left: 0;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
   }
   canvas:active { cursor: grabbing; }
   canvas.dragging-rod { cursor: none; }
@@ -28,284 +31,257 @@
 <script>
 (function() {
   /* ================================================================
-     GEOMETRY CONSTANTS
+     GEOMETRY CONSTANTS — IMMUTABLE
      Square prism: base side = 1, height = 2
      D1=(0,0,0) C1=(1,0,0) A1=(0,1,0) B1=(1,1,0)
      D =(0,0,2) C =(1,0,2) A =(0,1,2) B =(1,1,2)
      |PD1| = sqrt(5)
      ================================================================ */
-  var SQRT5 = Math.sqrt(5);
+  var ROD_RADIUS = Math.sqrt(5);
 
-  var GEOM = {
-    radius: SQRT5,
-    points: {
-      D1: [0, 0, 0],
-      C1: [1, 0, 0],
-      A1: [0, 1, 0],
-      B1: [1, 1, 0],
-      D:  [0, 0, 2],
-      C:  [1, 0, 2],
-      A:  [0, 1, 2],
-      B:  [1, 1, 2]
-    },
-    arcs: {
-      /* P_top(theta)  = (cos(theta), sin(theta), 2),       theta in [0, pi/2] */
-      top:   { color: '#FF8A2A' },
-      /* P_sideX(theta) = (1, 2*sin(theta), 2*cos(theta)),  theta in [0, pi/6] */
-      sideX: { color: '#7C4DFF' },
-      /* P_sideY(theta) = (2*sin(theta), 1, 2*cos(theta)),  theta in [0, pi/6] */
-      sideY: { color: '#20B26B' }
-    },
-    faces: [
-      ['D1','A1','B1','C1'],
-      ['D','C','B','A'],
-      ['D1','C1','C','D'],
-      ['A1','A','B','B1'],
-      ['D1','D','A','A1'],
-      ['C1','B1','B','C']
-    ],
-    edges: [
-      ['D1','C1'],['C1','B1'],['B1','A1'],['A1','D1'],
-      ['D','C'],['C','B'],['B','A'],['A','D'],
-      ['D1','D'],['C1','C'],['B1','B'],['A1','A']
-    ]
+  /* ---------- handfeel parameters ---------- */
+  var ROD_DRAG_SENSITIVITY = 0.0022;
+  var ROD_SMOOTHING        = 0.11;
+  var SCENE_SMOOTHING      = 0.12;
+  var MAX_POINTER_DELTA    = 28;
+  var TRACE_THRESHOLD      = 0.16;
+  var TRACE_BRUSH_RADIUS   = 3;
+  var SOFT_MAGNET_STRENGTH = 0.035;
+
+  /* ---------- immutable world coordinates ---------- */
+  var POINTS = {
+    D1: {x: 0, y: 0, z: 0},
+    C1: {x: 1, y: 0, z: 0},
+    A1: {x: 0, y: 1, z: 0},
+    B1: {x: 1, y: 1, z: 0},
+    D:  {x: 0, y: 0, z: 2},
+    C:  {x: 1, y: 0, z: 2},
+    A:  {x: 0, y: 1, z: 2},
+    B:  {x: 1, y: 1, z: 2}
   };
+
+  var MODEL_CENTER = {x: 0.5, y: 0.5, z: 1};
+
+  /* ---------- edges: 12 line segments, no crossing ---------- */
+  var EDGES = [
+    /* bottom D1-C1-B1-A1-D1 */
+    ["D1", "C1"], ["C1", "B1"], ["B1", "A1"], ["A1", "D1"],
+    /* top D-C-B-A-D */
+    ["D", "C"], ["C", "B"], ["B", "A"], ["A", "D"],
+    /* vertical */
+    ["D1", "D"], ["C1", "C"], ["B1", "B"], ["A1", "A"]
+  ];
+
+  /* ---------- 6 faces, correct winding ---------- */
+  var FACES = [
+    {name:"bottom", points:["D1","C1","B1","A1"], color:"rgba(220,230,242,0.18)"},
+    {name:"top",    points:["D","C","B","A"],     color:"rgba(220,230,242,0.18)"},
+    {name:"x0",     points:["D1","A1","A","D"],   color:"rgba(220,230,242,0.14)"},
+    {name:"x1",     points:["C1","B1","B","C"],   color:"rgba(220,230,242,0.16)"},
+    {name:"y0",     points:["D1","C1","C","D"],   color:"rgba(220,230,242,0.16)"},
+    {name:"y1",     points:["A1","B1","B","A"],   color:"rgba(220,230,242,0.16)"}
+  ];
+
+  /* ---------- arc colors ---------- */
+  var ARC_COLORS = {top: '#FF8A2A', sideX: '#7C4DFF', sideY: '#20B26B'};
+
+  /* ================================================================
+     VECTOR MATH (object-based {x,y,z})
+     ================================================================ */
+  function normalize3(v) {
+    var len = Math.hypot(v.x, v.y, v.z) || 1;
+    return {x: v.x / len, y: v.y / len, z: v.z / len};
+  }
+  function add3(a, b) { return {x: a.x + b.x, y: a.y + b.y, z: a.z + b.z}; }
+  function scale3(v, s) { return {x: v.x * s, y: v.y * s, z: v.z * s}; }
+  function dot3(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+  function dist3(a, b) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
+
+  function slerpDirection(a, b, t) {
+    var an = normalize3(a);
+    var bn = normalize3(b);
+    var cos = dot3(an, bn);
+    cos = Math.max(-1, Math.min(1, cos));
+    if (cos > 0.9995) {
+      return normalize3({x: an.x + (bn.x - an.x) * t, y: an.y + (bn.y - an.y) * t, z: an.z + (bn.z - an.z) * t});
+    }
+    var theta = Math.acos(cos);
+    var sinTheta = Math.sin(theta);
+    var w1 = Math.sin((1 - t) * theta) / sinTheta;
+    var w2 = Math.sin(t * theta) / sinTheta;
+    return normalize3({x: an.x * w1 + bn.x * w2, y: an.y * w1 + bn.y * w2, z: an.z * w1 + bn.z * w2});
+  }
 
   /* ================================================================
      ARC SAMPLING
      ================================================================ */
   var N_SAMPLES = 250;
-
   function sampleArc(type, n) {
-    var pts = [];
-    var i, theta;
+    var pts = [], i, theta;
     if (type === 'top') {
-      for (i = 0; i <= n; i++) {
-        theta = (i / n) * (Math.PI / 2);
-        pts.push([Math.cos(theta), Math.sin(theta), 2]);
-      }
+      for (i = 0; i <= n; i++) { theta = (i/n)*(Math.PI/2); pts.push({x:Math.cos(theta), y:Math.sin(theta), z:2}); }
     } else if (type === 'sideX') {
-      for (i = 0; i <= n; i++) {
-        theta = (i / n) * (Math.PI / 6);
-        pts.push([1, 2 * Math.sin(theta), 2 * Math.cos(theta)]);
-      }
+      for (i = 0; i <= n; i++) { theta = (i/n)*(Math.PI/6); pts.push({x:1, y:2*Math.sin(theta), z:2*Math.cos(theta)}); }
     } else if (type === 'sideY') {
-      for (i = 0; i <= n; i++) {
-        theta = (i / n) * (Math.PI / 6);
-        pts.push([2 * Math.sin(theta), 1, 2 * Math.cos(theta)]);
-      }
+      for (i = 0; i <= n; i++) { theta = (i/n)*(Math.PI/6); pts.push({x:2*Math.sin(theta), y:1, z:2*Math.cos(theta)}); }
     }
     return pts;
   }
-
-  var sampledArcs = {
-    top:   sampleArc('top', N_SAMPLES),
-    sideX: sampleArc('sideX', N_SAMPLES),
-    sideY: sampleArc('sideY', N_SAMPLES)
-  };
+  var arcSamples = {top: sampleArc('top', N_SAMPLES), sideX: sampleArc('sideX', N_SAMPLES), sideY: sampleArc('sideY', N_SAMPLES)};
 
   /* ================================================================
      STATE
      ================================================================ */
   var state = {
-    yaw: -0.55,
-    pitch: 0.55,
-    scale: 170,
-    width: 0,
-    height: 0,
-    draggingScene: false,
-    draggingRod: false,
-    /* unit direction; rodEnd = rodDirection * sqrt(5) */
-    rodDirection: [0.316227766, 0.316227766, 0.894427191],
-    rodEnd: [0.707106781, 0.707106781, 2.0],
+    yaw: -0.65, pitch: 0.55,
+    targetYaw: -0.65, targetPitch: 0.55,
+    scale: 230,
+    width: 0, height: 0,
+    draggingScene: false, draggingRod: false,
+    lastPointer: {x:0, y:0},
+    rodDirection: normalize3({x:0.72, y:0.38, z:0.58}),
+    targetDirection: normalize3({x:0.72, y:0.38, z:0.58}),
+    rodEnd: {x:0, y:0, z:0},
     activeArc: null,
-    visitedTop: [],
-    visitedSideX: [],
-    visitedSideY: [],
-    lastMouse: [0, 0]
+    visitedTop: [], visitedSideX: [], visitedSideY: []
   };
 
   /* ================================================================
-     DOM REFERENCES
+     DOM
      ================================================================ */
   var canvas = document.getElementById('c');
   var ctx = canvas.getContext('2d');
 
   /* ================================================================
-     RESIZE — DPR-aware for sharp rendering
+     RESIZE — DPR-aware
      ================================================================ */
   function resize() {
     var dpr = window.devicePixelRatio || 1;
     var w = window.innerWidth;
     var h = window.innerHeight;
-
     canvas.width  = Math.round(w * dpr);
     canvas.height = Math.round(h * dpr);
     canvas.style.width  = w + 'px';
     canvas.style.height = h + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
     state.width  = w;
     state.height = h;
   }
 
   /* ================================================================
-     3D ROTATION: R = Rx(pitch) * Rz(yaw), centered at prism centroid
+     3D ROTATION + ORTHOGRAPHIC PROJECTION
      ================================================================ */
-  function rotatePoint(point3D) {
-    var x = point3D[0], y = point3D[1], z = point3D[2];
-    /* translate to origin */
-    x -= 0.5; y -= 0.5; z -= 1.0;
-
-    /* Rz(yaw) */
+  function rotateView(p) {
+    var cx = p.x - MODEL_CENTER.x;
+    var cy = p.y - MODEL_CENTER.y;
+    var cz = p.z - MODEL_CENTER.z;
     var cosY = Math.cos(state.yaw), sinY = Math.sin(state.yaw);
-    var rx = x * cosY - y * sinY;
-    var ry = x * sinY + y * cosY;
-    var rz = z;
-
-    /* Rx(pitch) */
     var cosP = Math.cos(state.pitch), sinP = Math.sin(state.pitch);
-    var ry2 = ry * cosP - rz * sinP;
-    var rz2 = ry * sinP + rz * cosP;
-
-    return [rx, ry2, rz2];
+    /* Rz(yaw) */
+    var x1 = cx * cosY - cy * sinY;
+    var y1 = cx * sinY + cy * cosY;
+    var z1 = cz;
+    /* Rx(pitch) */
+    var x2 = x1;
+    var y2 = y1 * cosP - z1 * sinP;
+    var z2 = y1 * sinP + z1 * cosP;
+    return {x: x2, y: y2, z: z2};
   }
 
-  /* ================================================================
-     PROJECTION — perspective, output in CSS pixels
-     ================================================================ */
-  function project(point3D) {
-    var rx = point3D[0], ry = point3D[1], rz = point3D[2];
-    var s = state.scale;
-    var persp = 5.5 / (5.5 + rz);
+  function project(p) {
+    var r = rotateView(p);
     return {
-      sx: state.width / 2 + rx * s * persp,
-      sy: state.height / 2 - ry * s * persp,
-      depth: rz
+      x: state.width / 2 + r.x * state.scale,
+      y: state.height / 2 - r.z * state.scale,
+      depth: r.y
     };
   }
 
   /* ================================================================
-     NORMALIZE
+     SCREEN BASIS for rod dragging
      ================================================================ */
-  function normalize3(v) {
-    var len = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-    if (len < 1e-10) return [0, 0, 1];
-    return [v[0] / len, v[1] / len, v[2] / len];
-  }
-
-  /* ================================================================
-     CAMERA-AXIS HELPERS for rod dragging
-     cameraRight: world direction that maps to +screen-x
-     cameraUp:    world direction that maps to +screen-y
-     Derived from R^(-1) = Rz(-yaw) * Rx(-pitch)
-     ================================================================ */
-  function getCameraRight() {
-    return [Math.cos(state.yaw), -Math.sin(state.yaw), 0];
-  }
-
-  function getCameraUp() {
+  function getScreenBasisVectors() {
+    var cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
     var cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
-    var sy = Math.sin(state.yaw),   cy = Math.cos(state.yaw);
-    return [cp * sy, cp * cy, -sp];
+    var right = normalize3({x: cy, y: sy, z: 0});
+    var up    = normalize3({x: -sy * sp, y: -cy * sp, z: -cp});
+    return {right: right, up: up};
   }
 
   /* ================================================================
-     DRAW: Prism transparent faces (fill only, back-to-front)
+     DRAW: transparent faces — sorted by depth, far to near
      ================================================================ */
-  function drawPrism() {
-    var points = GEOM.points;
-    var faces  = GEOM.faces;
-
+  function drawFaces() {
     var faceData = [];
-    for (var f = 0; f < faces.length; f++) {
-      var verts = faces[f];
-      var projVerts = [];
+    for (var f = 0; f < FACES.length; f++) {
+      var face = FACES[f];
+      var projected = [];
       var sumDepth = 0;
-      for (var v = 0; v < verts.length; v++) {
-        var pt = points[verts[v]];
-        var r  = rotatePoint(pt);
-        var p  = project(r);
-        projVerts.push(p);
-        sumDepth += p.depth;
+      for (var v = 0; v < face.points.length; v++) {
+        var pp = project(POINTS[face.points[v]]);
+        projected.push(pp);
+        sumDepth += pp.depth;
       }
-      faceData.push({ verts: projVerts, avgDepth: sumDepth / verts.length });
+      faceData.push({color: face.color, projected: projected, avgDepth: sumDepth / face.points.length});
     }
-
-    faceData.sort(function(a, b) { return b.avgDepth - a.avgDepth; });
+    faceData.sort(function(a, b) { return a.avgDepth - b.avgDepth; });
 
     for (f = 0; f < faceData.length; f++) {
-      var fv = faceData[f].verts;
+      var fv = faceData[f];
       ctx.beginPath();
-      ctx.moveTo(fv[0].sx, fv[0].sy);
-      for (v = 1; v < fv.length; v++) {
-        ctx.lineTo(fv[v].sx, fv[v].sy);
+      ctx.moveTo(fv.projected[0].x, fv.projected[0].y);
+      for (v = 1; v < fv.projected.length; v++) {
+        ctx.lineTo(fv.projected[v].x, fv.projected[v].y);
       }
       ctx.closePath();
-      ctx.fillStyle = 'rgba(220, 230, 242, 0.20)';
+      ctx.fillStyle = fv.color;
       ctx.fill();
     }
   }
 
   /* ================================================================
-     DRAW: Prism edges (12 line segments)
+     DRAW: edges — only from EDGES table
      ================================================================ */
   function drawEdges() {
-    var points = GEOM.points;
-    var edges  = GEOM.edges;
-
     ctx.strokeStyle = '#334155';
-    ctx.lineWidth   = 2;
+    ctx.lineWidth   = 2.2;
     ctx.lineCap     = 'round';
     ctx.lineJoin    = 'round';
-
-    for (var e = 0; e < edges.length; e++) {
-      var p0 = points[edges[e][0]];
-      var p1 = points[edges[e][1]];
-      var r0 = rotatePoint(p0);
-      var r1 = rotatePoint(p1);
-      var s0 = project(r0);
-      var s1 = project(r1);
-
+    for (var e = 0; e < EDGES.length; e++) {
+      var p1 = project(POINTS[EDGES[e][0]]);
+      var p2 = project(POINTS[EDGES[e][1]]);
       ctx.beginPath();
-      ctx.moveTo(s0.sx, s0.sy);
-      ctx.lineTo(s1.sx, s1.sy);
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
       ctx.stroke();
     }
   }
 
   /* ================================================================
-     DRAW: D1 point + label (the ONLY visible text on the page)
+     DRAW: D1 point + label (the ONLY visible text)
      ================================================================ */
   function drawD1() {
-    var r = rotatePoint(GEOM.points.D1);
-    var p = project(r);
-
+    var p = project(POINTS.D1);
     ctx.beginPath();
-    ctx.arc(p.sx, p.sy, 8, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, 8, 0, Math.PI * 2);
     ctx.fillStyle = '#E53935';
     ctx.fill();
-
     ctx.font = '600 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
     ctx.fillStyle = '#E53935';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'bottom';
-    ctx.fillText('D1', p.sx + 11, p.sy - 9);
+    ctx.fillText('D1', p.x + 11, p.y - 9);
   }
 
   /* ================================================================
-     DRAW: Blue fixed-length rod from D1 to rodEnd
+     DRAW: blue rod from D1 to rodEnd
      ================================================================ */
   function drawRod() {
-    var r1 = rotatePoint(GEOM.points.D1);
-    var p1 = project(r1);
-
-    var r2 = rotatePoint(state.rodEnd);
-    var p2 = project(r2);
-
+    var p1 = project(POINTS.D1);
+    var p2 = project(state.rodEnd);
     ctx.beginPath();
-    ctx.moveTo(p1.sx, p1.sy);
-    ctx.lineTo(p2.sx, p2.sy);
+    ctx.moveTo(p1.x, p1.y);
+    ctx.lineTo(p2.x, p2.y);
     ctx.strokeStyle = '#2563EB';
     ctx.lineWidth   = 3.5;
     ctx.lineCap     = 'round';
@@ -313,87 +289,53 @@
   }
 
   /* ================================================================
-     DRAW: Red draggable endpoint
+     DRAW: red draggable endpoint
      ================================================================ */
   function drawRodEnd() {
-    var r = rotatePoint(state.rodEnd);
-    var p = project(r);
-
-    /* glow */
-    var grad = ctx.createRadialGradient(p.sx, p.sy, 3, p.sx, p.sy, 14);
-    grad.addColorStop(0, 'rgba(239, 68, 68, 0.5)');
-    grad.addColorStop(1, 'rgba(239, 68, 68, 0)');
-    ctx.beginPath();
-    ctx.arc(p.sx, p.sy, 14, 0, Math.PI * 2);
-    ctx.fillStyle = grad;
-    ctx.fill();
-
-    /* core */
-    ctx.beginPath();
-    ctx.arc(p.sx, p.sy, 9, 0, Math.PI * 2);
-    ctx.fillStyle = '#EF4444';
-    ctx.fill();
+    var p = project(state.rodEnd);
+    var grad = ctx.createRadialGradient(p.x, p.y, 3, p.x, p.y, 14);
+    grad.addColorStop(0, 'rgba(239,68,68,0.5)');
+    grad.addColorStop(1, 'rgba(239,68,68,0)');
+    ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, Math.PI*2); ctx.fillStyle = grad; ctx.fill();
+    ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, Math.PI*2); ctx.fillStyle = '#EF4444'; ctx.fill();
   }
 
   /* ================================================================
-     DRAW: Colored scratch trails (only visited segments)
+     DRAW: coloured scratch trails (only visited segments)
      ================================================================ */
   function drawScratches() {
     var arcDefs = [
-      { pts: sampledArcs.top,   visited: state.visitedTop,   color: GEOM.arcs.top.color   },
-      { pts: sampledArcs.sideX, visited: state.visitedSideX, color: GEOM.arcs.sideX.color },
-      { pts: sampledArcs.sideY, visited: state.visitedSideY, color: GEOM.arcs.sideY.color }
+      {pts: arcSamples.top,   visited: state.visitedTop,   color: ARC_COLORS.top},
+      {pts: arcSamples.sideX, visited: state.visitedSideX, color: ARC_COLORS.sideX},
+      {pts: arcSamples.sideY, visited: state.visitedSideY, color: ARC_COLORS.sideY}
     ];
-
     for (var a = 0; a < arcDefs.length; a++) {
-      var pts     = arcDefs[a].pts;
-      var visited = arcDefs[a].visited;
-      var color   = arcDefs[a].color;
-
+      var pts = arcDefs[a].pts, visited = arcDefs[a].visited, color = arcDefs[a].color;
       var segStart = -1;
       for (var i = 0; i < pts.length; i++) {
-        if (visited[i]) {
-          if (segStart < 0) segStart = i;
-        } else {
-          if (segStart >= 0) {
-            drawArcSegment(pts, segStart, i - 1, color);
-            segStart = -1;
-          }
-        }
+        if (visited[i]) { if (segStart < 0) segStart = i; }
+        else { if (segStart >= 0) { drawArcSegment(pts, segStart, i-1, color); segStart = -1; } }
       }
-      if (segStart >= 0) {
-        drawArcSegment(pts, segStart, pts.length - 1, color);
-      }
+      if (segStart >= 0) { drawArcSegment(pts, segStart, pts.length-1, color); }
     }
   }
-
   function drawArcSegment(pts, start, end, color) {
     if (end - start < 1) return;
     ctx.beginPath();
-    var r0 = rotatePoint(pts[start]);
-    var p0 = project(r0);
-    ctx.moveTo(p0.sx, p0.sy);
-    for (var i = start + 1; i <= end; i++) {
-      var ri = rotatePoint(pts[i]);
-      var pi = project(ri);
-      ctx.lineTo(pi.sx, pi.sy);
-    }
-    ctx.strokeStyle = color;
-    ctx.lineWidth   = 6;
-    ctx.lineCap     = 'round';
-    ctx.lineJoin    = 'round';
+    var p0 = project(pts[start]); ctx.moveTo(p0.x, p0.y);
+    for (var i = start+1; i <= end; i++) { var pi = project(pts[i]); ctx.lineTo(pi.x, pi.y); }
+    ctx.strokeStyle = color; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
     ctx.stroke();
   }
 
   /* ================================================================
-     MAIN DRAW
+     MAIN DRAW — order: bg → faces → scratches → edges → rod → D1 → endpoint
      ================================================================ */
   function draw() {
     ctx.clearRect(0, 0, state.width, state.height);
     ctx.fillStyle = '#F7F8FA';
     ctx.fillRect(0, 0, state.width, state.height);
-
-    drawPrism();
+    drawFaces();
     drawScratches();
     drawEdges();
     drawRod();
@@ -402,190 +344,162 @@
   }
 
   /* ================================================================
-     ARC SNAP LOGIC
+     TRACE — only marks visited, NEVER locks rod
      ================================================================ */
-  function findNearestArcPoint(worldPt) {
-    var bestDist = Infinity;
-    var bestArc  = null;
-    var bestIdx  = -1;
-    var bestPt   = null;
-
-    var arcs = [
-      { pts: sampledArcs.top,   name: 'top'   },
-      { pts: sampledArcs.sideX, name: 'sideX' },
-      { pts: sampledArcs.sideY, name: 'sideY' }
-    ];
-
-    for (var a = 0; a < arcs.length; a++) {
-      var pts = arcs[a].pts;
-      for (var i = 0; i < pts.length; i++) {
-        var dx   = worldPt[0] - pts[i][0];
-        var dy   = worldPt[1] - pts[i][1];
-        var dz   = worldPt[2] - pts[i][2];
-        var dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestArc  = arcs[a].name;
-          bestIdx  = i;
-          bestPt   = pts[i];
-        }
+  function findNearestArcPoint(point) {
+    var best = null;
+    function scan(name, samples) {
+      for (var i = 0; i < samples.length; i++) {
+        var d = dist3(point, samples[i]);
+        if (!best || d < best.distance) { best = {arcName:name, index:i, point:samples[i], distance:d}; }
       }
     }
-    return { dist: bestDist, arc: bestArc, idx: bestIdx, pt: bestPt };
+    scan('top', arcSamples.top); scan('sideX', arcSamples.sideX); scan('sideY', arcSamples.sideY);
+    return best;
   }
-
-  function markVisited(arcName, idx, radius) {
+  function markVisited(arcName, index) {
     var visited;
-    if (arcName === 'top')        visited = state.visitedTop;
+    if (arcName === 'top') visited = state.visitedTop;
     else if (arcName === 'sideX') visited = state.visitedSideX;
-    else                          visited = state.visitedSideY;
-
-    var lo = Math.max(0, idx - radius);
-    var hi = Math.min(visited.length - 1, idx + radius);
-    for (var i = lo; i <= hi; i++) {
-      visited[i] = true;
+    else if (arcName === 'sideY') visited = state.visitedSideY;
+    else return;
+    for (var k = -TRACE_BRUSH_RADIUS; k <= TRACE_BRUSH_RADIUS; k++) {
+      var j = index + k;
+      if (j >= 0 && j < visited.length) visited[j] = true;
     }
   }
-
-  var SNAP_THRESHOLD = 0.16;
-
-  function snapIfNearArc(worldPt) {
-    var result = findNearestArcPoint(worldPt);
-    if (result.dist < SNAP_THRESHOLD && result.arc) {
-      markVisited(result.arc, result.idx, 14);
-      state.activeArc = result.arc;
-      return result.pt;
-    }
-    state.activeArc = null;
-    return null;
+  function traceIfNearValidArc(rodEnd) {
+    var nearest = findNearestArcPoint(rodEnd);
+    if (!nearest || nearest.distance > TRACE_THRESHOLD) { state.activeArc = null; return; }
+    state.activeArc = nearest.arcName;
+    markVisited(nearest.arcName, nearest.index);
   }
 
   /* ================================================================
-     INTERACTION
+     SOFT MAGNET — gentle, does NOT lock rod
      ================================================================ */
-  function handlePointerDown(e) {
+  function applySoftMagnetToTarget(point) {
+    var nearest = findNearestArcPoint(point);
+    if (!nearest || nearest.distance > TRACE_THRESHOLD) return;
+    var arcDir = normalize3(nearest.point);
+    state.targetDirection = slerpDirection(state.targetDirection, arcDir, SOFT_MAGNET_STRENGTH);
+    markVisited(nearest.arcName, nearest.index);
+  }
+
+  /* ================================================================
+     UPDATE TARGET ROD DIRECTION from pointer delta
+     ================================================================ */
+  function updateTargetRodDirection(dx, dy) {
+    var basis = getScreenBasisVectors();
+    var delta = add3(scale3(basis.right, dx * ROD_DRAG_SENSITIVITY), scale3(basis.up, -dy * ROD_DRAG_SENSITIVITY));
+    state.targetDirection = normalize3(add3(state.targetDirection, delta));
+    applySoftMagnetToTarget(scale3(state.targetDirection, ROD_RADIUS));
+  }
+
+  /* ================================================================
+     INTERACTION HANDLERS
+     ================================================================ */
+  function getCanvasPoint(e) {
     var rect = canvas.getBoundingClientRect();
-    var mx = e.clientX - rect.left;
-    var my = e.clientY - rect.top;
-    state.lastMouse[0] = mx;
-    state.lastMouse[1] = my;
-
-    var r  = rotatePoint(state.rodEnd);
-    var p  = project(r);
-    var ddx = mx - p.sx;
-    var ddy = my - p.sy;
-    var distToEnd = Math.sqrt(ddx * ddx + ddy * ddy);
-
-    if (distToEnd < 26) {
-      state.draggingRod   = true;
-      state.draggingScene = false;
+    return {x: e.clientX - rect.left, y: e.clientY - rect.top};
+  }
+  function handlePointerDown(e) {
+    var p = getCanvasPoint(e);
+    state.lastPointer = p;
+    var pr = project(state.rodEnd);
+    var ddx = p.x - pr.x, ddy = p.y - pr.y;
+    if (Math.sqrt(ddx*ddx + ddy*ddy) < 26) {
+      state.draggingRod = true; state.draggingScene = false;
       canvas.classList.add('dragging-rod');
     } else {
-      state.draggingScene = true;
-      state.draggingRod   = false;
+      state.draggingScene = true; state.draggingRod = false;
       canvas.style.cursor = 'grabbing';
     }
   }
-
   function handlePointerMove(e) {
     e.preventDefault();
-    var rect = canvas.getBoundingClientRect();
-    var mx = e.clientX - rect.left;
-    var my = e.clientY - rect.top;
-    var dx = mx - state.lastMouse[0];
-    var dy = my - state.lastMouse[1];
-    state.lastMouse[0] = mx;
-    state.lastMouse[1] = my;
-
-    if (state.draggingRod) {
-      /* Camera-relative free rotation on virtual sphere of radius sqrt(5).
-         No box clamping — endpoint moves freely in space. */
-      var sens = 0.006;
-      var dir  = state.rodDirection;
-      var cr   = getCameraRight();
-      var cu   = getCameraUp();
-
-      var nx = dir[0] + cr[0] * dx * sens + cu[0] * (-dy * sens);
-      var ny = dir[1] + cr[1] * dx * sens + cu[1] * (-dy * sens);
-      var nz = dir[2] + cr[2] * dx * sens + cu[2] * (-dy * sens);
-
-      state.rodDirection = normalize3([nx, ny, nz]);
-      state.rodEnd = [
-        state.rodDirection[0] * SQRT5,
-        state.rodDirection[1] * SQRT5,
-        state.rodDirection[2] * SQRT5
-      ];
-
-      /* Snap to trajectory only when near valid arcs */
-      var snapped = snapIfNearArc(state.rodEnd);
-      if (snapped) {
-        state.rodDirection = normalize3(snapped);
-        state.rodEnd = [
-          state.rodDirection[0] * SQRT5,
-          state.rodDirection[1] * SQRT5,
-          state.rodDirection[2] * SQRT5
-        ];
-      }
-
-      draw();
-    } else if (state.draggingScene) {
-      state.yaw   += dx * 0.006;
-      state.pitch -= dy * 0.006;
-      if (state.pitch >  1.4) state.pitch =  1.4;
-      if (state.pitch < -1.4) state.pitch = -1.4;
-      draw();
-    }
-  }
-
-  function handlePointerUp(e) {
-    if (state.draggingRod) {
-      state.draggingRod = false;
-      canvas.classList.remove('dragging-rod');
-    }
+    var p = getCanvasPoint(e);
+    var dx = p.x - state.lastPointer.x, dy = p.y - state.lastPointer.y;
+    dx = Math.max(-MAX_POINTER_DELTA, Math.min(MAX_POINTER_DELTA, dx));
+    dy = Math.max(-MAX_POINTER_DELTA, Math.min(MAX_POINTER_DELTA, dy));
+    state.lastPointer = p;
+    if (state.draggingRod) { updateTargetRodDirection(dx, dy); return; }
     if (state.draggingScene) {
-      state.draggingScene = false;
-      canvas.style.cursor = 'grab';
+      state.targetYaw   += dx * 0.006;
+      state.targetPitch += dy * 0.006;
+      if (state.targetPitch >  1.15) state.targetPitch =  1.15;
+      if (state.targetPitch < -1.15) state.targetPitch = -1.15;
     }
   }
-
+  function handlePointerUp(e) {
+    if (state.draggingRod) { state.draggingRod = false; canvas.classList.remove('dragging-rod'); }
+    if (state.draggingScene) { state.draggingScene = false; canvas.style.cursor = 'grab'; }
+  }
   function handleWheel(e) {
     e.preventDefault();
     state.scale += e.deltaY * -0.12;
-    if (state.scale < 80)  state.scale = 80;
+    if (state.scale < 80) state.scale = 80;
     if (state.scale > 380) state.scale = 380;
-    draw();
   }
 
   /* ================================================================
-     SELF-CHECK
+     GEOMETRY SELF-CHECKS
      ================================================================ */
+  function assertClose(actual, expected, eps, message) {
+    if (Math.abs(actual - expected) > eps) { throw new Error(message + ': ' + actual + ' !== ' + expected); }
+  }
+  function lengthBetween(a, b) {
+    var p = POINTS[a], q = POINTS[b];
+    return Math.hypot(p.x - q.x, p.y - q.y, p.z - q.z);
+  }
+  function selfCheckPrismGeometry() {
+    /* bottom: all sides = 1 */
+    assertClose(lengthBetween("D1","C1"), 1, 1e-9, "D1C1");
+    assertClose(lengthBetween("C1","B1"), 1, 1e-9, "C1B1");
+    assertClose(lengthBetween("B1","A1"), 1, 1e-9, "B1A1");
+    assertClose(lengthBetween("A1","D1"), 1, 1e-9, "A1D1");
+    /* top: all sides = 1 */
+    assertClose(lengthBetween("D","C"), 1, 1e-9, "DC");
+    assertClose(lengthBetween("C","B"), 1, 1e-9, "CB");
+    assertClose(lengthBetween("B","A"), 1, 1e-9, "BA");
+    assertClose(lengthBetween("A","D"), 1, 1e-9, "AD");
+    /* vertical: all = 2 */
+    assertClose(lengthBetween("D1","D"), 2, 1e-9, "D1D");
+    assertClose(lengthBetween("C1","C"), 2, 1e-9, "C1C");
+    assertClose(lengthBetween("B1","B"), 2, 1e-9, "B1B");
+    assertClose(lengthBetween("A1","A"), 2, 1e-9, "A1A");
+  }
   function selfCheckGeometry() {
     var i, pt, dist;
-
-    /* rodEnd must be sqrt(5) from D1=(0,0,0) */
-    var re = state.rodEnd;
-    var rodDist = Math.sqrt(re[0]*re[0] + re[1]*re[1] + re[2]*re[2]);
-    if (Math.abs(rodDist - SQRT5) > 1e-6) return false;
-
-    /* topArc: z=2, x^2+y^2+z^2=5 */
-    for (i = 0; i < sampledArcs.top.length; i++) {
-      pt   = sampledArcs.top[i];
-      dist = Math.sqrt(pt[0]*pt[0] + pt[1]*pt[1] + pt[2]*pt[2]);
-      if (Math.abs(pt[2] - 2) > 0.002 || Math.abs(dist - SQRT5) > 0.002) return false;
+    /* topArc: z=2, |pt|=sqrt(5) */
+    for (i = 0; i < arcSamples.top.length; i++) {
+      pt = arcSamples.top[i]; dist = Math.hypot(pt.x, pt.y, pt.z);
+      if (Math.abs(pt.z - 2) > 0.002 || Math.abs(dist - ROD_RADIUS) > 0.002) return false;
     }
-    /* sideXArc: x=1, x^2+y^2+z^2=5 */
-    for (i = 0; i < sampledArcs.sideX.length; i++) {
-      pt   = sampledArcs.sideX[i];
-      dist = Math.sqrt(pt[0]*pt[0] + pt[1]*pt[1] + pt[2]*pt[2]);
-      if (Math.abs(pt[0] - 1) > 0.002 || Math.abs(dist - SQRT5) > 0.002) return false;
+    /* sideXArc: x=1, |pt|=sqrt(5) */
+    for (i = 0; i < arcSamples.sideX.length; i++) {
+      pt = arcSamples.sideX[i]; dist = Math.hypot(pt.x, pt.y, pt.z);
+      if (Math.abs(pt.x - 1) > 0.002 || Math.abs(dist - ROD_RADIUS) > 0.002) return false;
     }
-    /* sideYArc: y=1, x^2+y^2+z^2=5 */
-    for (i = 0; i < sampledArcs.sideY.length; i++) {
-      pt   = sampledArcs.sideY[i];
-      dist = Math.sqrt(pt[0]*pt[0] + pt[1]*pt[1] + pt[2]*pt[2]);
-      if (Math.abs(pt[1] - 1) > 0.002 || Math.abs(dist - SQRT5) > 0.002) return false;
+    /* sideYArc: y=1, |pt|=sqrt(5) */
+    for (i = 0; i < arcSamples.sideY.length; i++) {
+      pt = arcSamples.sideY[i]; dist = Math.hypot(pt.x, pt.y, pt.z);
+      if (Math.abs(pt.y - 1) > 0.002 || Math.abs(dist - ROD_RADIUS) > 0.002) return false;
     }
     return true;
+  }
+
+  /* ================================================================
+     ANIMATION LOOP — smooth scene + rod following
+     ================================================================ */
+  function animate() {
+    requestAnimationFrame(animate);
+    state.yaw   += (state.targetYaw   - state.yaw)   * SCENE_SMOOTHING;
+    state.pitch += (state.targetPitch - state.pitch) * SCENE_SMOOTHING;
+    state.rodDirection = slerpDirection(state.rodDirection, state.targetDirection, ROD_SMOOTHING);
+    state.rodEnd = scale3(state.rodDirection, ROD_RADIUS);
+    traceIfNearValidArc(state.rodEnd);
+    draw();
   }
 
   /* ================================================================
@@ -593,28 +507,21 @@
      ================================================================ */
   function init() {
     resize();
-
     for (var k = 0; k <= N_SAMPLES; k++) {
-      state.visitedTop.push(false);
-      state.visitedSideX.push(false);
-      state.visitedSideY.push(false);
+      state.visitedTop.push(false); state.visitedSideX.push(false); state.visitedSideY.push(false);
     }
-
+    state.rodEnd = scale3(state.rodDirection, ROD_RADIUS);
     canvas.addEventListener('pointerdown', handlePointerDown);
     canvas.addEventListener('pointermove', handlePointerMove);
     canvas.addEventListener('pointerup', handlePointerUp);
     canvas.addEventListener('pointerleave', handlePointerUp);
-    canvas.addEventListener('wheel', handleWheel, { passive: false });
+    canvas.addEventListener('wheel', handleWheel, {passive: false});
     canvas.addEventListener('contextmenu', function(e) { e.preventDefault(); });
-
-    if (!selfCheckGeometry()) {
-      /* geometry must be correct by construction */
-    }
-
-    draw();
+    window.addEventListener('resize', function() { resize(); draw(); });
+    selfCheckPrismGeometry();
+    if (!selfCheckGeometry()) { /* should never fail */ }
+    animate();
   }
-
-  window.addEventListener('resize', function() { resize(); draw(); });
   init();
 })();
 </script>
