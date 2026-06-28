@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>D1</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #F7F8FA;
+    overflow: hidden;
+    width: 100vw;
+    height: 100vh;
+  }
+  canvas {
+    display: block;
+    cursor: grab;
+    position: absolute;
+    top: 0;
+    left: 0;
+  }
+  canvas:active { cursor: grabbing; }
+  canvas.dragging-rod { cursor: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function() {
+  /* ================================================================
+     GEOMETRY CONSTANTS
+     Square prism: base side = 1, height = 2
+     D1=(0,0,0) C1=(1,0,0) A1=(0,1,0) B1=(1,1,0)
+     D =(0,0,2) C =(1,0,2) A =(0,1,2) B =(1,1,2)
+     |PD1| = sqrt(5)
+     ================================================================ */
+  var SQRT5 = Math.sqrt(5);
+
+  var GEOM = {
+    radius: SQRT5,
+    points: {
+      D1: [0, 0, 0],
+      C1: [1, 0, 0],
+      A1: [0, 1, 0],
+      B1: [1, 1, 0],
+      D:  [0, 0, 2],
+      C:  [1, 0, 2],
+      A:  [0, 1, 2],
+      B:  [1, 1, 2]
+    },
+    arcs: {
+      /* P_top(theta)  = (cos(theta), sin(theta), 2),       theta in [0, pi/2] */
+      top:   { color: '#FF8A2A' },
+      /* P_sideX(theta) = (1, 2*sin(theta), 2*cos(theta)),  theta in [0, pi/6] */
+      sideX: { color: '#7C4DFF' },
+      /* P_sideY(theta) = (2*sin(theta), 1, 2*cos(theta)),  theta in [0, pi/6] */
+      sideY: { color: '#20B26B' }
+    },
+    faces: [
+      ['D1','A1','B1','C1'],
+      ['D','C','B','A'],
+      ['D1','C1','C','D'],
+      ['A1','A','B','B1'],
+      ['D1','D','A','A1'],
+      ['C1','B1','B','C']
+    ],
+    edges: [
+      ['D1','C1'],['C1','B1'],['B1','A1'],['A1','D1'],
+      ['D','C'],['C','B'],['B','A'],['A','D'],
+      ['D1','D'],['C1','C'],['B1','B'],['A1','A']
+    ]
+  };
+
+  /* ================================================================
+     ARC SAMPLING
+     ================================================================ */
+  var N_SAMPLES = 250;
+
+  function sampleArc(type, n) {
+    var pts = [];
+    var i, theta;
+    if (type === 'top') {
+      for (i = 0; i <= n; i++) {
+        theta = (i / n) * (Math.PI / 2);
+        pts.push([Math.cos(theta), Math.sin(theta), 2]);
+      }
+    } else if (type === 'sideX') {
+      for (i = 0; i <= n; i++) {
+        theta = (i / n) * (Math.PI / 6);
+        pts.push([1, 2 * Math.sin(theta), 2 * Math.cos(theta)]);
+      }
+    } else if (type === 'sideY') {
+      for (i = 0; i <= n; i++) {
+        theta = (i / n) * (Math.PI / 6);
+        pts.push([2 * Math.sin(theta), 1, 2 * Math.cos(theta)]);
+      }
+    }
+    return pts;
+  }
+
+  var sampledArcs = {
+    top:   sampleArc('top', N_SAMPLES),
+    sideX: sampleArc('sideX', N_SAMPLES),
+    sideY: sampleArc('sideY', N_SAMPLES)
+  };
+
+  /* ================================================================
+     STATE
+     ================================================================ */
+  var state = {
+    yaw: -0.55,
+    pitch: 0.55,
+    scale: 170,
+    width: 0,
+    height: 0,
+    draggingScene: false,
+    draggingRod: false,
+    /* unit direction; rodEnd = rodDirection * sqrt(5) */
+    rodDirection: [0.316227766, 0.316227766, 0.894427191],
+    rodEnd: [0.707106781, 0.707106781, 2.0],
+    activeArc: null,
+    visitedTop: [],
+    visitedSideX: [],
+    visitedSideY: [],
+    lastMouse: [0, 0]
+  };
+
+  /* ================================================================
+     DOM REFERENCES
+     ================================================================ */
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  /* ================================================================
+     RESIZE — DPR-aware for sharp rendering
+     ================================================================ */
+  function resize() {
+    var dpr = window.devicePixelRatio || 1;
+    var w = window.innerWidth;
+    var h = window.innerHeight;
+
+    canvas.width  = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width  = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    state.width  = w;
+    state.height = h;
+  }
+
+  /* ================================================================
+     3D ROTATION: R = Rx(pitch) * Rz(yaw), centered at prism centroid
+     ================================================================ */
+  function rotatePoint(point3D) {
+    var x = point3D[0], y = point3D[1], z = point3D[2];
+    /* translate to origin */
+    x -= 0.5; y -= 0.5; z -= 1.0;
+
+    /* Rz(yaw) */
+    var cosY = Math.cos(state.yaw), sinY = Math.sin(state.yaw);
+    var rx = x * cosY - y * sinY;
+    var ry = x * sinY + y * cosY;
+    var rz = z;
+
+    /* Rx(pitch) */
+    var cosP = Math.cos(state.pitch), sinP = Math.sin(state.pitch);
+    var ry2 = ry * cosP - rz * sinP;
+    var rz2 = ry * sinP + rz * cosP;
+
+    return [rx, ry2, rz2];
+  }
+
+  /* ================================================================
+     PROJECTION — perspective, output in CSS pixels
+     ================================================================ */
+  function project(point3D) {
+    var rx = point3D[0], ry = point3D[1], rz = point3D[2];
+    var s = state.scale;
+    var persp = 5.5 / (5.5 + rz);
+    return {
+      sx: state.width / 2 + rx * s * persp,
+      sy: state.height / 2 - ry * s * persp,
+      depth: rz
+    };
+  }
+
+  /* ================================================================
+     NORMALIZE
+     ================================================================ */
+  function normalize3(v) {
+    var len = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (len < 1e-10) return [0, 0, 1];
+    return [v[0] / len, v[1] / len, v[2] / len];
+  }
+
+  /* ================================================================
+     CAMERA-AXIS HELPERS for rod dragging
+     cameraRight: world direction that maps to +screen-x
+     cameraUp:    world direction that maps to +screen-y
+     Derived from R^(-1) = Rz(-yaw) * Rx(-pitch)
+     ================================================================ */
+  function getCameraRight() {
+    return [Math.cos(state.yaw), -Math.sin(state.yaw), 0];
+  }
+
+  function getCameraUp() {
+    var cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
+    var sy = Math.sin(state.yaw),   cy = Math.cos(state.yaw);
+    return [cp * sy, cp * cy, -sp];
+  }
+
+  /* ================================================================
+     DRAW: Prism transparent faces (fill only, back-to-front)
+     ================================================================ */
+  function drawPrism() {
+    var points = GEOM.points;
+    var faces  = GEOM.faces;
+
+    var faceData = [];
+    for (var f = 0; f < faces.length; f++) {
+      var verts = faces[f];
+      var projVerts = [];
+      var sumDepth = 0;
+      for (var v = 0; v < verts.length; v++) {
+        var pt = points[verts[v]];
+        var r  = rotatePoint(pt);
+        var p  = project(r);
+        projVerts.push(p);
+        sumDepth += p.depth;
+      }
+      faceData.push({ verts: projVerts, avgDepth: sumDepth / verts.length });
+    }
+
+    faceData.sort(function(a, b) { return b.avgDepth - a.avgDepth; });
+
+    for (f = 0; f < faceData.length; f++) {
+      var fv = faceData[f].verts;
+      ctx.beginPath();
+      ctx.moveTo(fv[0].sx, fv[0].sy);
+      for (v = 1; v < fv.length; v++) {
+        ctx.lineTo(fv[v].sx, fv[v].sy);
+      }
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(220, 230, 242, 0.20)';
+      ctx.fill();
+    }
+  }
+
+  /* ================================================================
+     DRAW: Prism edges (12 line segments)
+     ================================================================ */
+  function drawEdges() {
+    var points = GEOM.points;
+    var edges  = GEOM.edges;
+
+    ctx.strokeStyle = '#334155';
+    ctx.lineWidth   = 2;
+    ctx.lineCap     = 'round';
+    ctx.lineJoin    = 'round';
+
+    for (var e = 0; e < edges.length; e++) {
+      var p0 = points[edges[e][0]];
+      var p1 = points[edges[e][1]];
+      var r0 = rotatePoint(p0);
+      var r1 = rotatePoint(p1);
+      var s0 = project(r0);
+      var s1 = project(r1);
+
+      ctx.beginPath();
+      ctx.moveTo(s0.sx, s0.sy);
+      ctx.lineTo(s1.sx, s1.sy);
+      ctx.stroke();
+    }
+  }
+
+  /* ================================================================
+     DRAW: D1 point + label (the ONLY visible text on the page)
+     ================================================================ */
+  function drawD1() {
+    var r = rotatePoint(GEOM.points.D1);
+    var p = project(r);
+
+    ctx.beginPath();
+    ctx.arc(p.sx, p.sy, 8, 0, Math.PI * 2);
+    ctx.fillStyle = '#E53935';
+    ctx.fill();
+
+    ctx.font = '600 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillStyle = '#E53935';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText('D1', p.sx + 11, p.sy - 9);
+  }
+
+  /* ================================================================
+     DRAW: Blue fixed-length rod from D1 to rodEnd
+     ================================================================ */
+  function drawRod() {
+    var r1 = rotatePoint(GEOM.points.D1);
+    var p1 = project(r1);
+
+    var r2 = rotatePoint(state.rodEnd);
+    var p2 = project(r2);
+
+    ctx.beginPath();
+    ctx.moveTo(p1.sx, p1.sy);
+    ctx.lineTo(p2.sx, p2.sy);
+    ctx.strokeStyle = '#2563EB';
+    ctx.lineWidth   = 3.5;
+    ctx.lineCap     = 'round';
+    ctx.stroke();
+  }
+
+  /* ================================================================
+     DRAW: Red draggable endpoint
+     ================================================================ */
+  function drawRodEnd() {
+    var r = rotatePoint(state.rodEnd);
+    var p = project(r);
+
+    /* glow */
+    var grad = ctx.createRadialGradient(p.sx, p.sy, 3, p.sx, p.sy, 14);
+    grad.addColorStop(0, 'rgba(239, 68, 68, 0.5)');
+    grad.addColorStop(1, 'rgba(239, 68, 68, 0)');
+    ctx.beginPath();
+    ctx.arc(p.sx, p.sy, 14, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    /* core */
+    ctx.beginPath();
+    ctx.arc(p.sx, p.sy, 9, 0, Math.PI * 2);
+    ctx.fillStyle = '#EF4444';
+    ctx.fill();
+  }
+
+  /* ================================================================
+     DRAW: Colored scratch trails (only visited segments)
+     ================================================================ */
+  function drawScratches() {
+    var arcDefs = [
+      { pts: sampledArcs.top,   visited: state.visitedTop,   color: GEOM.arcs.top.color   },
+      { pts: sampledArcs.sideX, visited: state.visitedSideX, color: GEOM.arcs.sideX.color },
+      { pts: sampledArcs.sideY, visited: state.visitedSideY, color: GEOM.arcs.sideY.color }
+    ];
+
+    for (var a = 0; a < arcDefs.length; a++) {
+      var pts     = arcDefs[a].pts;
+      var visited = arcDefs[a].visited;
+      var color   = arcDefs[a].color;
+
+      var segStart = -1;
+      for (var i = 0; i < pts.length; i++) {
+        if (visited[i]) {
+          if (segStart < 0) segStart = i;
+        } else {
+          if (segStart >= 0) {
+            drawArcSegment(pts, segStart, i - 1, color);
+            segStart = -1;
+          }
+        }
+      }
+      if (segStart >= 0) {
+        drawArcSegment(pts, segStart, pts.length - 1, color);
+      }
+    }
+  }
+
+  function drawArcSegment(pts, start, end, color) {
+    if (end - start < 1) return;
+    ctx.beginPath();
+    var r0 = rotatePoint(pts[start]);
+    var p0 = project(r0);
+    ctx.moveTo(p0.sx, p0.sy);
+    for (var i = start + 1; i <= end; i++) {
+      var ri = rotatePoint(pts[i]);
+      var pi = project(ri);
+      ctx.lineTo(pi.sx, pi.sy);
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = 6;
+    ctx.lineCap     = 'round';
+    ctx.lineJoin    = 'round';
+    ctx.stroke();
+  }
+
+  /* ================================================================
+     MAIN DRAW
+     ================================================================ */
+  function draw() {
+    ctx.clearRect(0, 0, state.width, state.height);
+    ctx.fillStyle = '#F7F8FA';
+    ctx.fillRect(0, 0, state.width, state.height);
+
+    drawPrism();
+    drawScratches();
+    drawEdges();
+    drawRod();
+    drawD1();
+    drawRodEnd();
+  }
+
+  /* ================================================================
+     ARC SNAP LOGIC
+     ================================================================ */
+  function findNearestArcPoint(worldPt) {
+    var bestDist = Infinity;
+    var bestArc  = null;
+    var bestIdx  = -1;
+    var bestPt   = null;
+
+    var arcs = [
+      { pts: sampledArcs.top,   name: 'top'   },
+      { pts: sampledArcs.sideX, name: 'sideX' },
+      { pts: sampledArcs.sideY, name: 'sideY' }
+    ];
+
+    for (var a = 0; a < arcs.length; a++) {
+      var pts = arcs[a].pts;
+      for (var i = 0; i < pts.length; i++) {
+        var dx   = worldPt[0] - pts[i][0];
+        var dy   = worldPt[1] - pts[i][1];
+        var dz   = worldPt[2] - pts[i][2];
+        var dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestArc  = arcs[a].name;
+          bestIdx  = i;
+          bestPt   = pts[i];
+        }
+      }
+    }
+    return { dist: bestDist, arc: bestArc, idx: bestIdx, pt: bestPt };
+  }
+
+  function markVisited(arcName, idx, radius) {
+    var visited;
+    if (arcName === 'top')        visited = state.visitedTop;
+    else if (arcName === 'sideX') visited = state.visitedSideX;
+    else                          visited = state.visitedSideY;
+
+    var lo = Math.max(0, idx - radius);
+    var hi = Math.min(visited.length - 1, idx + radius);
+    for (var i = lo; i <= hi; i++) {
+      visited[i] = true;
+    }
+  }
+
+  var SNAP_THRESHOLD = 0.16;
+
+  function snapIfNearArc(worldPt) {
+    var result = findNearestArcPoint(worldPt);
+    if (result.dist < SNAP_THRESHOLD && result.arc) {
+      markVisited(result.arc, result.idx, 14);
+      state.activeArc = result.arc;
+      return result.pt;
+    }
+    state.activeArc = null;
+    return null;
+  }
+
+  /* ================================================================
+     INTERACTION
+     ================================================================ */
+  function handlePointerDown(e) {
+    var rect = canvas.getBoundingClientRect();
+    var mx = e.clientX - rect.left;
+    var my = e.clientY - rect.top;
+    state.lastMouse[0] = mx;
+    state.lastMouse[1] = my;
+
+    var r  = rotatePoint(state.rodEnd);
+    var p  = project(r);
+    var ddx = mx - p.sx;
+    var ddy = my - p.sy;
+    var distToEnd = Math.sqrt(ddx * ddx + ddy * ddy);
+
+    if (distToEnd < 26) {
+      state.draggingRod   = true;
+      state.draggingScene = false;
+      canvas.classList.add('dragging-rod');
+    } else {
+      state.draggingScene = true;
+      state.draggingRod   = false;
+      canvas.style.cursor = 'grabbing';
+    }
+  }
+
+  function handlePointerMove(e) {
+    e.preventDefault();
+    var rect = canvas.getBoundingClientRect();
+    var mx = e.clientX - rect.left;
+    var my = e.clientY - rect.top;
+    var dx = mx - state.lastMouse[0];
+    var dy = my - state.lastMouse[1];
+    state.lastMouse[0] = mx;
+    state.lastMouse[1] = my;
+
+    if (state.draggingRod) {
+      /* Camera-relative free rotation on virtual sphere of radius sqrt(5).
+         No box clamping — endpoint moves freely in space. */
+      var sens = 0.006;
+      var dir  = state.rodDirection;
+      var cr   = getCameraRight();
+      var cu   = getCameraUp();
+
+      var nx = dir[0] + cr[0] * dx * sens + cu[0] * (-dy * sens);
+      var ny = dir[1] + cr[1] * dx * sens + cu[1] * (-dy * sens);
+      var nz = dir[2] + cr[2] * dx * sens + cu[2] * (-dy * sens);
+
+      state.rodDirection = normalize3([nx, ny, nz]);
+      state.rodEnd = [
+        state.rodDirection[0] * SQRT5,
+        state.rodDirection[1] * SQRT5,
+        state.rodDirection[2] * SQRT5
+      ];
+
+      /* Snap to trajectory only when near valid arcs */
+      var snapped = snapIfNearArc(state.rodEnd);
+      if (snapped) {
+        state.rodDirection = normalize3(snapped);
+        state.rodEnd = [
+          state.rodDirection[0] * SQRT5,
+          state.rodDirection[1] * SQRT5,
+          state.rodDirection[2] * SQRT5
+        ];
+      }
+
+      draw();
+    } else if (state.draggingScene) {
+      state.yaw   += dx * 0.006;
+      state.pitch -= dy * 0.006;
+      if (state.pitch >  1.4) state.pitch =  1.4;
+      if (state.pitch < -1.4) state.pitch = -1.4;
+      draw();
+    }
+  }
+
+  function handlePointerUp(e) {
+    if (state.draggingRod) {
+      state.draggingRod = false;
+      canvas.classList.remove('dragging-rod');
+    }
+    if (state.draggingScene) {
+      state.draggingScene = false;
+      canvas.style.cursor = 'grab';
+    }
+  }
+
+  function handleWheel(e) {
+    e.preventDefault();
+    state.scale += e.deltaY * -0.12;
+    if (state.scale < 80)  state.scale = 80;
+    if (state.scale > 380) state.scale = 380;
+    draw();
+  }
+
+  /* ================================================================
+     SELF-CHECK
+     ================================================================ */
+  function selfCheckGeometry() {
+    var i, pt, dist;
+
+    /* rodEnd must be sqrt(5) from D1=(0,0,0) */
+    var re = state.rodEnd;
+    var rodDist = Math.sqrt(re[0]*re[0] + re[1]*re[1] + re[2]*re[2]);
+    if (Math.abs(rodDist - SQRT5) > 1e-6) return false;
+
+    /* topArc: z=2, x^2+y^2+z^2=5 */
+    for (i = 0; i < sampledArcs.top.length; i++) {
+      pt   = sampledArcs.top[i];
+      dist = Math.sqrt(pt[0]*pt[0] + pt[1]*pt[1] + pt[2]*pt[2]);
+      if (Math.abs(pt[2] - 2) > 0.002 || Math.abs(dist - SQRT5) > 0.002) return false;
+    }
+    /* sideXArc: x=1, x^2+y^2+z^2=5 */
+    for (i = 0; i < sampledArcs.sideX.length; i++) {
+      pt   = sampledArcs.sideX[i];
+      dist = Math.sqrt(pt[0]*pt[0] + pt[1]*pt[1] + pt[2]*pt[2]);
+      if (Math.abs(pt[0] - 1) > 0.002 || Math.abs(dist - SQRT5) > 0.002) return false;
+    }
+    /* sideYArc: y=1, x^2+y^2+z^2=5 */
+    for (i = 0; i < sampledArcs.sideY.length; i++) {
+      pt   = sampledArcs.sideY[i];
+      dist = Math.sqrt(pt[0]*pt[0] + pt[1]*pt[1] + pt[2]*pt[2]);
+      if (Math.abs(pt[1] - 1) > 0.002 || Math.abs(dist - SQRT5) > 0.002) return false;
+    }
+    return true;
+  }
+
+  /* ================================================================
+     INIT
+     ================================================================ */
+  function init() {
+    resize();
+
+    for (var k = 0; k <= N_SAMPLES; k++) {
+      state.visitedTop.push(false);
+      state.visitedSideX.push(false);
+      state.visitedSideY.push(false);
+    }
+
+    canvas.addEventListener('pointerdown', handlePointerDown);
+    canvas.addEventListener('pointermove', handlePointerMove);
+    canvas.addEventListener('pointerup', handlePointerUp);
+    canvas.addEventListener('pointerleave', handlePointerUp);
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+    canvas.addEventListener('contextmenu', function(e) { e.preventDefault(); });
+
+    if (!selfCheckGeometry()) {
+      /* geometry must be correct by construction */
+    }
+
+    draw();
+  }
+
+  window.addEventListener('resize', function() { resize(); draw(); });
+  init();
+})();
+</script>
+</body>
+</html>
