@@ -40,12 +40,12 @@
   var ROD_RADIUS = Math.sqrt(5);
 
   /* ---------- handfeel parameters ---------- */
-  var ROD_SMOOTHING_DRAG  = 0.48;
+  var ROD_SMOOTHING_DRAG  = 0.55;
   var ROD_SMOOTHING_IDLE  = 0.22;
   var SCENE_SMOOTHING     = 0.16;
-  var TRACE_THRESHOLD     = 0.22;
+  var TRACE_THRESHOLD     = 0.24;
   var TRACE_BRUSH_RADIUS  = 5;
-  var TRACE_SWEEP_STEPS   = 16;
+  var TRACE_SWEEP_STEPS   = 18;
 
   /* ---------- immutable world coordinates ---------- */
   var POINTS = {
@@ -94,7 +94,18 @@
   function add3(a, b) { return {x: a.x + b.x, y: a.y + b.y, z: a.z + b.z}; }
   function scale3(v, s) { return {x: v.x * s, y: v.y * s, z: v.z * s}; }
   function dot3(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+  function cross3(a, b) { return {x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x}; }
   function dist3(a, b) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
+
+  function rotateAroundAxis(v, axis, angle) {
+    axis = normalize3(axis);
+    var cos = Math.cos(angle);
+    var sin = Math.sin(angle);
+    var term1 = scale3(v, cos);
+    var term2 = scale3(cross3(axis, v), sin);
+    var term3 = scale3(axis, dot3(axis, v) * (1 - cos));
+    return normalize3(add3(add3(term1, term2), term3));
+  }
 
   function slerpDirection(a, b, t) {
     var an = normalize3(a);
@@ -224,6 +235,19 @@
     var y0 = -x1 * sinY + y1 * cosY;
     var z0 = z1;
     return {x: x0, y: y0, z: z0};
+  }
+
+  function rotateTargetRodByDrag(dx, dy) {
+    var maxDelta = 36;
+    dx = Math.max(-maxDelta, Math.min(maxDelta, dx));
+    dy = Math.max(-maxDelta, Math.min(maxDelta, dy));
+    var speed = 0.006;
+    var screenRightAxis = unrotateVector({x: 1, y: 0, z: 0});
+    var screenUpAxis = unrotateVector({x: 0, y: 0, z: 1});
+    var dir = normalize3(state.targetDirection);
+    dir = rotateAroundAxis(dir, screenUpAxis, -dx * speed);
+    dir = rotateAroundAxis(dir, screenRightAxis, -dy * speed);
+    state.targetDirection = normalize3(dir);
   }
 
   /* ================================================================
@@ -484,7 +508,6 @@
     if (Math.sqrt(ddx*ddx + ddy*ddy) < 36) {
       state.draggingRod = true; state.draggingScene = false;
       if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
-      updateTargetRodFromPointer(p);
       canvas.classList.add('dragging-rod');
       return;
     }
@@ -499,7 +522,7 @@
     var dy = p.y - state.lastPointer.y;
     state.lastPointer = p;
     if (state.draggingRod) {
-      updateTargetRodFromPointer(p);
+      rotateTargetRodByDrag(dx, dy);
       return;
     }
     if (state.draggingScene) {
