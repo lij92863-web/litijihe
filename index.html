@@ -40,13 +40,12 @@
   var ROD_RADIUS = Math.sqrt(5);
 
   /* ---------- handfeel parameters ---------- */
-  var ROD_DRAG_SENSITIVITY = 0.0022;
-  var ROD_SMOOTHING        = 0.11;
-  var SCENE_SMOOTHING      = 0.12;
-  var MAX_POINTER_DELTA    = 28;
+  var ROD_SMOOTHING        = 0.32;
+  var ROD_SMOOTHING_IDLE   = 0.16;
+  var SCENE_SMOOTHING      = 0.16;
   var TRACE_THRESHOLD      = 0.16;
   var TRACE_BRUSH_RADIUS   = 3;
-  var SOFT_MAGNET_STRENGTH = 0.035;
+  var SOFT_MAGNET_STRENGTH = 0.0;
 
   /* ---------- immutable world coordinates ---------- */
   var POINTS = {
@@ -198,14 +197,68 @@
   }
 
   /* ================================================================
-     SCREEN BASIS for rod dragging
+     VECTOR ROTATION (no centering — for directions, not points)
      ================================================================ */
-  function getScreenBasisVectors() {
-    var cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
-    var cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
-    var right = normalize3({x: cy, y: sy, z: 0});
-    var up    = normalize3({x: -sy * sp, y: -cy * sp, z: -cp});
-    return {right: right, up: up};
+  function rotateVector(v) {
+    var cosY = Math.cos(state.yaw), sinY = Math.sin(state.yaw);
+    var cosP = Math.cos(state.pitch), sinP = Math.sin(state.pitch);
+    var x1 = v.x * cosY - v.y * sinY;
+    var y1 = v.x * sinY + v.y * cosY;
+    var z1 = v.z;
+    var x2 = x1;
+    var y2 = y1 * cosP - z1 * sinP;
+    var z2 = y1 * sinP + z1 * cosP;
+    return {x: x2, y: y2, z: z2};
+  }
+
+  function unrotateVector(v) {
+    var cosY = Math.cos(state.yaw), sinY = Math.sin(state.yaw);
+    var cosP = Math.cos(state.pitch), sinP = Math.sin(state.pitch);
+    /* inverse Rx */
+    var x1 = v.x;
+    var y1 = v.y * cosP + v.z * sinP;
+    var z1 = -v.y * sinP + v.z * cosP;
+    /* inverse Rz */
+    var x0 = x1 * cosY + y1 * sinY;
+    var y0 = -x1 * sinY + y1 * cosY;
+    var z0 = z1;
+    return {x: x0, y: y0, z: z0};
+  }
+
+  /* ================================================================
+     MAP POINTER TO VIRTUAL SPHERE — direct, no delta accumulation
+     ================================================================ */
+  function updateTargetRodFromPointer(pointer) {
+    var d1Screen = project(POINTS.D1);
+
+    /* pointer offset from D1 in view space */
+    var vx = (pointer.x - d1Screen.x) / state.scale;
+    var vz = -(pointer.y - d1Screen.y) / state.scale;
+
+    var r = ROD_RADIUS;
+    var screenLen2 = vx * vx + vz * vz;
+    var max2 = r * r * 0.999;
+
+    /* clamp to virtual-sphere screen projection circle */
+    if (screenLen2 > max2) {
+      var scl = Math.sqrt(max2 / screenLen2);
+      vx *= scl;
+      vz *= scl;
+      screenLen2 = vx * vx + vz * vz;
+    }
+
+    var vyAbs = Math.sqrt(Math.max(0, r * r - screenLen2));
+
+    /* pick depth sign closest to current rod direction to avoid hemisphere flip */
+    var currentView = rotateVector(scale3(state.targetDirection, ROD_RADIUS));
+    var vyA = vyAbs;
+    var vyB = -vyAbs;
+    var vy = Math.abs(currentView.y - vyA) <= Math.abs(currentView.y - vyB) ? vyA : vyB;
+
+    var viewVec = {x: vx, y: vy, z: vz};
+    var worldVec = unrotateVector(viewVec);
+
+    state.targetDirection = normalize3(worldVec);
   }
 
   /* ================================================================
@@ -376,24 +429,10 @@
   }
 
   /* ================================================================
-     SOFT MAGNET — gentle, does NOT lock rod
+     SOFT MAGNET — disabled (SOFT_MAGNET_STRENGTH = 0), kept for reference
      ================================================================ */
   function applySoftMagnetToTarget(point) {
-    var nearest = findNearestArcPoint(point);
-    if (!nearest || nearest.distance > TRACE_THRESHOLD) return;
-    var arcDir = normalize3(nearest.point);
-    state.targetDirection = slerpDirection(state.targetDirection, arcDir, SOFT_MAGNET_STRENGTH);
-    markVisited(nearest.arcName, nearest.index);
-  }
-
-  /* ================================================================
-     UPDATE TARGET ROD DIRECTION from pointer delta
-     ================================================================ */
-  function updateTargetRodDirection(dx, dy) {
-    var basis = getScreenBasisVectors();
-    var delta = add3(scale3(basis.right, dx * ROD_DRAG_SENSITIVITY), scale3(basis.up, -dy * ROD_DRAG_SENSITIVITY));
-    state.targetDirection = normalize3(add3(state.targetDirection, delta));
-    applySoftMagnetToTarget(scale3(state.targetDirection, ROD_RADIUS));
+    /* intentionally disabled — never locks rod to trajectory */
   }
 
   /* ================================================================
@@ -408,30 +447,39 @@
     state.lastPointer = p;
     var pr = project(state.rodEnd);
     var ddx = p.x - pr.x, ddy = p.y - pr.y;
-    if (Math.sqrt(ddx*ddx + ddy*ddy) < 26) {
+    if (Math.sqrt(ddx*ddx + ddy*ddy) < 34) {
       state.draggingRod = true; state.draggingScene = false;
+      if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+      updateTargetRodFromPointer(p);
       canvas.classList.add('dragging-rod');
     } else {
       state.draggingScene = true; state.draggingRod = false;
+      if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
       canvas.style.cursor = 'grabbing';
     }
   }
   function handlePointerMove(e) {
     e.preventDefault();
     var p = getCanvasPoint(e);
-    var dx = p.x - state.lastPointer.x, dy = p.y - state.lastPointer.y;
-    dx = Math.max(-MAX_POINTER_DELTA, Math.min(MAX_POINTER_DELTA, dx));
-    dy = Math.max(-MAX_POINTER_DELTA, Math.min(MAX_POINTER_DELTA, dy));
-    state.lastPointer = p;
-    if (state.draggingRod) { updateTargetRodDirection(dx, dy); return; }
+    if (state.draggingRod) {
+      state.lastPointer = p;
+      updateTargetRodFromPointer(p);
+      return;
+    }
     if (state.draggingScene) {
-      state.targetYaw   += dx * 0.006;
-      state.targetPitch += dy * 0.006;
+      var dx = p.x - state.lastPointer.x;
+      var dy = p.y - state.lastPointer.y;
+      state.lastPointer = p;
+      state.targetYaw   += dx * 0.0045;
+      state.targetPitch += dy * 0.0045;
       if (state.targetPitch >  1.15) state.targetPitch =  1.15;
       if (state.targetPitch < -1.15) state.targetPitch = -1.15;
     }
   }
   function handlePointerUp(e) {
+    if (canvas.releasePointerCapture) {
+      try { canvas.releasePointerCapture(e.pointerId); } catch (err) {}
+    }
     if (state.draggingRod) { state.draggingRod = false; canvas.classList.remove('dragging-rod'); }
     if (state.draggingScene) { state.draggingScene = false; canvas.style.cursor = 'grab'; }
   }
@@ -496,7 +544,8 @@
     requestAnimationFrame(animate);
     state.yaw   += (state.targetYaw   - state.yaw)   * SCENE_SMOOTHING;
     state.pitch += (state.targetPitch - state.pitch) * SCENE_SMOOTHING;
-    state.rodDirection = slerpDirection(state.rodDirection, state.targetDirection, ROD_SMOOTHING);
+    var rodSmooth = state.draggingRod ? ROD_SMOOTHING : ROD_SMOOTHING_IDLE;
+    state.rodDirection = slerpDirection(state.rodDirection, state.targetDirection, rodSmooth);
     state.rodEnd = scale3(state.rodDirection, ROD_RADIUS);
     traceIfNearValidArc(state.rodEnd);
     draw();
