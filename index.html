@@ -40,9 +40,8 @@
   var ROD_RADIUS = Math.sqrt(5);
 
   /* ---------- handfeel parameters ---------- */
-  var ROD_SMOOTHING_IDLE  = 0.20;
   var SCENE_SMOOTHING     = 0.16;
-  var TRACE_THRESHOLD     = 0.25;
+  var TRACE_THRESHOLD     = 0.24;
   var TRACE_BRUSH_RADIUS  = 5;
   var TRACE_SWEEP_STEPS   = 20;
 
@@ -149,11 +148,12 @@
     width: 0, height: 0,
     draggingScene: false, draggingRod: false,
     lastPointer: {x:0, y:0},
-    lastArcballVec: null,
     rodDirection: normalize3({x:0.72, y:0.38, z:0.58}),
     targetDirection: normalize3({x:0.72, y:0.38, z:0.58}),
     rodEnd: {x:0, y:0, z:0},
     prevRodEnd: null,
+    grabOffset: {x:0, y:0},
+    activePointerId: null,
     activeArc: null,
     visitedTop: [], visitedSideX: [], visitedSideY: []
   };
@@ -238,86 +238,42 @@
     return {x: x0, y: y0, z: z0};
   }
 
-  function mapPointerToArcball(pointer) {
-    var center = project(POINTS.D1);
-    var radiusPx = Math.max(160, Math.min(320, ROD_RADIUS * state.scale * 0.72));
-    var nx = (pointer.x - center.x) / radiusPx;
-    var nz = -(pointer.y - center.y) / radiusPx;
-    var len2 = nx * nx + nz * nz;
-    var ny;
-    if (len2 <= 1) {
-      ny = Math.sqrt(1 - len2);
-    } else {
-      var len = Math.sqrt(len2);
-      nx /= len;
-      nz /= len;
-      ny = 0;
-    }
-    return normalize3({x: nx, y: ny, z: nz});
-  }
-
-  function rotateRodByArcball(pointer) {
-    var current = mapPointerToArcball(pointer);
-    if (!state.lastArcballVec) {
-      state.lastArcballVec = current;
-      return;
-    }
-    var prev = state.lastArcballVec;
-    var axisView = cross3(prev, current);
-    var axisLen = length3(axisView);
-    if (axisLen < 1e-6) {
-      state.lastArcballVec = current;
-      return;
-    }
-    var dot = dot3(prev, current);
-    dot = Math.max(-1, Math.min(1, dot));
-    var angle = Math.atan2(axisLen, dot);
-    var maxAngle = 0.18;
-    if (angle > maxAngle) angle = maxAngle;
-    var speed = 1.15;
-    angle *= speed;
-    var axisWorld = normalize3(unrotateVector(axisView));
-    state.targetDirection = rotateAroundAxis(state.targetDirection, axisWorld, angle);
-    state.targetDirection = normalize3(state.targetDirection);
-    state.rodDirection = state.targetDirection;
-    state.rodEnd = scale3(state.rodDirection, ROD_RADIUS);
-    state.lastArcballVec = current;
-  }
-
-  /* ================================================================
-     MAP POINTER TO VIRTUAL SPHERE — direct, no delta accumulation
-     ================================================================ */
-  function updateTargetRodFromPointer(pointer) {
+  function setRodFromDesiredScreenPoint(screenPoint) {
     var d1Screen = project(POINTS.D1);
 
-    /* pointer offset from D1 in view space */
-    var vx = (pointer.x - d1Screen.x) / state.scale;
-    var vz = -(pointer.y - d1Screen.y) / state.scale;
+    /* screen offset from D1 in view space */
+    var vx = (screenPoint.x - d1Screen.x) / state.scale;
+    var vz = -(screenPoint.y - d1Screen.y) / state.scale;
 
     var r = ROD_RADIUS;
     var screenLen2 = vx * vx + vz * vz;
     var max2 = r * r * 0.999;
 
-    /* clamp to virtual-sphere screen projection circle */
+    /* clamp to sphere projection circle — the only case where cursor and endpoint separate */
     if (screenLen2 > max2) {
-      var scl = Math.sqrt(max2 / screenLen2);
-      vx *= scl;
-      vz *= scl;
+      var s = Math.sqrt(max2 / screenLen2);
+      vx *= s;
+      vz *= s;
       screenLen2 = vx * vx + vz * vz;
     }
 
+    /* view space: x = screen horizontal, y = depth, z = screen vertical */
     var vyAbs = Math.sqrt(Math.max(0, r * r - screenLen2));
 
-    /* pick depth sign closest to current rod direction to avoid hemisphere flip */
-    var currentView = rotateVector(scale3(state.targetDirection, ROD_RADIUS));
-    var vyA = vyAbs;
-    var vyB = -vyAbs;
-    var vy = Math.abs(currentView.y - vyA) <= Math.abs(currentView.y - vyB) ? vyA : vyB;
+    /* pick depth sign closest to current direction to avoid hemisphere flip */
+    var currentView = rotateVector(scale3(state.rodDirection, ROD_RADIUS));
+    var vy1 = vyAbs;
+    var vy2 = -vyAbs;
+    var vy = Math.abs(currentView.y - vy1) <= Math.abs(currentView.y - vy2) ? vy1 : vy2;
 
     var viewVec = {x: vx, y: vy, z: vz};
     var worldVec = unrotateVector(viewVec);
 
     state.targetDirection = normalize3(worldVec);
+
+    /* drag — no lag: update display direction immediately */
+    state.rodDirection = state.targetDirection;
+    state.rodEnd = scale3(state.rodDirection, ROD_RADIUS);
   }
 
   /* ================================================================
@@ -539,15 +495,16 @@
     state.lastPointer = p;
     var pr = project(state.rodEnd);
     var ddx = p.x - pr.x, ddy = p.y - pr.y;
-    if (Math.sqrt(ddx*ddx + ddy*ddy) < 42) {
+    if (Math.sqrt(ddx*ddx + ddy*ddy) < 48) {
       state.draggingRod = true; state.draggingScene = false;
-      state.lastArcballVec = mapPointerToArcball(p);
+      state.activePointerId = e.pointerId;
+      state.grabOffset = {x: p.x - pr.x, y: p.y - pr.y};
       if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
       canvas.classList.add('dragging-rod');
       return;
     }
     state.draggingScene = true; state.draggingRod = false;
-    state.lastArcballVec = null;
+    state.activePointerId = e.pointerId;
     if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
     canvas.style.cursor = 'grabbing';
   }
@@ -558,11 +515,12 @@
     var dy = p.y - state.lastPointer.y;
     state.lastPointer = p;
     if (state.draggingRod) {
-      rotateRodByArcball(p);
+      var desiredScreenPoint = {x: p.x - state.grabOffset.x, y: p.y - state.grabOffset.y};
+      setRodFromDesiredScreenPoint(desiredScreenPoint);
       return;
     }
     if (state.draggingScene) {
-      var maxDelta = 32;
+      var maxDelta = 36;
       dx = Math.max(-maxDelta, Math.min(maxDelta, dx));
       dy = Math.max(-maxDelta, Math.min(maxDelta, dy));
       state.targetYaw   += dx * 0.0045;
@@ -574,7 +532,8 @@
   function handlePointerUp(e) {
     state.draggingRod = false;
     state.draggingScene = false;
-    state.lastArcballVec = null;
+    state.activePointerId = null;
+    state.grabOffset = {x:0, y:0};
     canvas.classList.remove('dragging-rod');
     canvas.style.cursor = '';
     if (canvas.releasePointerCapture) {
@@ -642,12 +601,11 @@
     requestAnimationFrame(animate);
     state.yaw   += (state.targetYaw   - state.yaw)   * SCENE_SMOOTHING;
     state.pitch += (state.targetPitch - state.pitch) * SCENE_SMOOTHING;
-    if (state.draggingRod) {
-      state.rodDirection = normalize3(state.rodDirection);
-      state.targetDirection = normalize3(state.targetDirection);
-    } else {
-      state.rodDirection = slerpDirection(state.rodDirection, state.targetDirection, ROD_SMOOTHING_IDLE);
+    if (!state.draggingRod) {
+      state.rodDirection = slerpDirection(state.rodDirection, state.targetDirection, 0.22);
     }
+    state.rodDirection = normalize3(state.rodDirection);
+    state.targetDirection = normalize3(state.targetDirection);
     var nextRodEnd = scale3(state.rodDirection, ROD_RADIUS);
     traceSweptRod(state.prevRodEnd, nextRodEnd);
     state.rodEnd = nextRodEnd;
@@ -672,6 +630,7 @@
     canvas.addEventListener('pointermove', handlePointerMove);
     canvas.addEventListener('pointerup', handlePointerUp);
     canvas.addEventListener('pointerleave', handlePointerUp);
+    canvas.addEventListener('pointercancel', handlePointerUp);
     canvas.addEventListener('wheel', handleWheel, {passive: false});
     canvas.addEventListener('contextmenu', function(e) { e.preventDefault(); });
     window.addEventListener('resize', function() { resize(); draw(); });
