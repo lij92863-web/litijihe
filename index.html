@@ -40,12 +40,12 @@
   var ROD_RADIUS = Math.sqrt(5);
 
   /* ---------- handfeel parameters ---------- */
-  var ROD_SMOOTHING_DRAG  = 0.42;
-  var ROD_SMOOTHING_IDLE  = 0.18;
+  var ROD_SMOOTHING_DRAG  = 0.48;
+  var ROD_SMOOTHING_IDLE  = 0.22;
   var SCENE_SMOOTHING     = 0.16;
-  var TRACE_THRESHOLD     = 0.20;
-  var TRACE_BRUSH_RADIUS  = 4;
-  var TRACE_SWEEP_STEPS   = 10;
+  var TRACE_THRESHOLD     = 0.22;
+  var TRACE_BRUSH_RADIUS  = 5;
+  var TRACE_SWEEP_STEPS   = 16;
 
   /* ---------- immutable world coordinates ---------- */
   var POINTS = {
@@ -476,11 +476,12 @@
     return {x: e.clientX - rect.left, y: e.clientY - rect.top};
   }
   function handlePointerDown(e) {
+    e.preventDefault();
     var p = getCanvasPoint(e);
     state.lastPointer = p;
     var pr = project(state.rodEnd);
     var ddx = p.x - pr.x, ddy = p.y - pr.y;
-    if (Math.sqrt(ddx*ddx + ddy*ddy) < 34) {
+    if (Math.sqrt(ddx*ddx + ddy*ddy) < 36) {
       state.draggingRod = true; state.draggingScene = false;
       if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
       updateTargetRodFromPointer(p);
@@ -584,6 +585,7 @@
     var smooth = state.draggingRod ? ROD_SMOOTHING_DRAG : ROD_SMOOTHING_IDLE;
     state.rodDirection = slerpDirection(state.rodDirection, state.targetDirection, smooth);
     state.rodDirection = normalize3(state.rodDirection);
+    state.targetDirection = normalize3(state.targetDirection);
     var nextRodEnd = scale3(state.rodDirection, ROD_RADIUS);
     traceSweptRod(state.prevRodEnd, nextRodEnd);
     state.rodEnd = nextRodEnd;
@@ -600,6 +602,8 @@
     for (var k = 0; k <= N_SAMPLES; k++) {
       state.visitedTop.push(false); state.visitedSideX.push(false); state.visitedSideY.push(false);
     }
+    state.rodDirection = normalize3(state.rodDirection);
+    state.targetDirection = normalize3(state.targetDirection);
     state.rodEnd = scale3(state.rodDirection, ROD_RADIUS);
     state.prevRodEnd = {x: state.rodEnd.x, y: state.rodEnd.y, z: state.rodEnd.z};
     canvas.addEventListener('pointerdown', handlePointerDown);
